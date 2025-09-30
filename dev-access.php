@@ -3,7 +3,7 @@
  * Plugin Name:       DEV Access & Environment Tools
  * Plugin URI:        https://akkusys.de
  * Description:       DEV-Umgebung Erkennung, ADMIN-Bar Styling, Login-Branding, Zugriffsbegrenzung und Sicherheits-Audit-Log.
- * Version:           1.2.1
+ * Version:           1.2.2
  * Author:            Marc Mirschel
  * Author URI:        https://mirschel.biz
  * License:           GPL-2.0-or-later
@@ -16,16 +16,44 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 // Plugin-Konstanten definieren
-define( 'DAET_VERSION', '1.2.1' );
+define( 'DAET_VERSION', '1.2.2' );
 define( 'DAET_PLUGIN_FILE', __FILE__ );
 define( 'DAET_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'DAET_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 define( 'DAET_AUDIT_TABLE', 'daet_audit_log' );
+define( 'DAET_DB_VERSION', '1.0' );
 
 /**
  * Plugin-Aktivierung: Erstelle Audit-Log-Tabelle
  */
-register_activation_hook( __FILE__, 'daet_create_audit_table' );
+register_activation_hook( __FILE__, 'daet_activation' );
+function daet_activation() {
+    daet_create_audit_table();
+    
+    // Setze Default-Werte für wichtige Optionen
+    $options = get_option( 'daet_settings', array() );
+    
+    // Aktiviere Audit-Log standardmäßig
+    if ( ! isset( $options['enable_audit_log'] ) ) {
+        $options['enable_audit_log'] = 1;
+    }
+    
+    // Aktiviere Debug-Log standardmäßig für DEV
+    if ( ! isset( $options['enable_debug_log'] ) ) {
+        $options['enable_debug_log'] = 1;
+    }
+    
+    // Setze Default Retention Days
+    if ( ! isset( $options['audit_retention_days'] ) ) {
+        $options['audit_retention_days'] = 30;
+    }
+    
+    update_option( 'daet_settings', $options );
+}
+
+/**
+ * Erstellt oder aktualisiert die Audit-Log-Tabelle
+ */
 function daet_create_audit_table() {
     global $wpdb;
     $table_name = $wpdb->prefix . DAET_AUDIT_TABLE;
@@ -51,7 +79,26 @@ function daet_create_audit_table() {
     dbDelta( $sql );
     
     // Versionsnummer speichern für zukünftige Updates
-    update_option( 'daet_db_version', '1.0' );
+    update_option( 'daet_db_version', DAET_DB_VERSION );
+}
+
+/**
+ * Prüft bei jedem Admin-Init, ob die Tabelle existiert
+ */
+add_action( 'admin_init', 'daet_check_database' );
+function daet_check_database() {
+    $installed_version = get_option( 'daet_db_version' );
+    
+    if ( $installed_version !== DAET_DB_VERSION ) {
+        daet_create_audit_table();
+    }
+    
+    // Prüfe ob Tabelle wirklich existiert
+    global $wpdb;
+    $table_name = $wpdb->prefix . DAET_AUDIT_TABLE;
+    if ( $wpdb->get_var( "SHOW TABLES LIKE '$table_name'" ) != $table_name ) {
+        daet_create_audit_table();
+    }
 }
 
 /**
@@ -77,6 +124,10 @@ function daet_uninstall() {
     // Lösche Audit-Tabelle
     $table_name = $wpdb->prefix . DAET_AUDIT_TABLE;
     $wpdb->query( "DROP TABLE IF EXISTS $table_name" );
+    
+    // Lösche Transients
+    $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_daet_login_attempts_%'" );
+    $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_timeout_daet_login_attempts_%'" );
 }
 
 /**
@@ -88,7 +139,7 @@ function daet_load_textdomain() {
 add_action( 'plugins_loaded', 'daet_load_textdomain' );
 
 /**
- * Audit-Log-Funktion
+ * Audit-Log-Funktion mit verbesserter Fehlerbehandlung
  * @param string $event_type Art des Events
  * @param string $severity Schweregrad (info, warning, error, critical)
  * @param array $details Zusätzliche Details
@@ -96,12 +147,33 @@ add_action( 'plugins_loaded', 'daet_load_textdomain' );
 function daet_audit_log( $event_type, $severity = 'info', $details = array() ) {
     global $wpdb;
     
-    $options = get_option( 'daet_settings' );
-    if ( empty( $options['enable_audit_log'] ) ) {
-        return;
+    // Prüfe ob Audit-Log aktiviert ist
+    $options = get_option( 'daet_settings', array() );
+    
+    // Standardmäßig aktiviert, wenn Option nicht gesetzt
+    $audit_enabled = isset( $options['enable_audit_log'] ) ? $options['enable_audit_log'] : 1;
+    
+    if ( ! $audit_enabled ) {
+        return false;
     }
     
     $table_name = $wpdb->prefix . DAET_AUDIT_TABLE;
+    
+    // Prüfe ob Tabelle existiert
+    if ( $wpdb->get_var( "SHOW TABLES LIKE '$table_name'" ) != $table_name ) {
+        // Versuche Tabelle zu erstellen
+        daet_create_audit_table();
+        
+        // Prüfe erneut
+        if ( $wpdb->get_var( "SHOW TABLES LIKE '$table_name'" ) != $table_name ) {
+            // Tabelle konnte nicht erstellt werden, logge in error_log
+            if ( defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
+                error_log( '[DAET] Audit table could not be created' );
+            }
+            return false;
+        }
+    }
+    
     $current_user = wp_get_current_user();
     
     $data = array(
@@ -115,15 +187,28 @@ function daet_audit_log( $event_type, $severity = 'info', $details = array() ) {
         'event_time' => current_time( 'mysql' )
     );
     
-    $wpdb->insert( $table_name, $data );
+    $result = $wpdb->insert( $table_name, $data );
+    
+    // Debug-Ausgabe bei Fehler
+    if ( $result === false && defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
+        error_log( '[DAET] Audit log insert failed: ' . $wpdb->last_error );
+    }
+    
+    return $result;
 }
 
 /**
- * Cleanup alte Audit-Logs (älter als 30 Tage)
+ * Cleanup alte Audit-Logs (älter als X Tage)
  */
 function daet_cleanup_old_audit_logs() {
     global $wpdb;
     $table_name = $wpdb->prefix . DAET_AUDIT_TABLE;
+    
+    // Prüfe ob Tabelle existiert
+    if ( $wpdb->get_var( "SHOW TABLES LIKE '$table_name'" ) != $table_name ) {
+        return;
+    }
+    
     $options = get_option( 'daet_settings' );
     $retention_days = isset( $options['audit_retention_days'] ) ? intval( $options['audit_retention_days'] ) : 30;
     
@@ -297,9 +382,24 @@ function daet_audit_log_page() {
         daet_audit_log( 'audit_log_cleared', 'info', array( 'cleared_by' => wp_get_current_user()->user_login ) );
         echo '<div class="notice notice-success"><p>' . esc_html__( 'Audit log has been cleared.', 'dev-access' ) . '</p></div>';
     }
+    
+    // Status-Anzeige
+    $audit_enabled = isset( $options['enable_audit_log'] ) ? $options['enable_audit_log'] : 1;
     ?>
     <div class="wrap">
         <h1><?php esc_html_e( 'Security Audit Log', 'dev-access' ); ?></h1>
+        
+        <?php if ( ! $audit_enabled ) : ?>
+            <div class="notice notice-warning">
+                <p><?php 
+                printf( 
+                    esc_html__( 'Audit logging is currently disabled. %s to enable it.', 'dev-access' ),
+                    '<a href="' . admin_url( 'options-general.php?page=daet_plugin_settings#enable_audit_log' ) . '">' . esc_html__( 'Go to settings', 'dev-access' ) . '</a>'
+                );
+                ?></p>
+            </div>
+        <?php endif; ?>
+        
         <p><?php esc_html_e( 'Monitor all security-related events on your site.', 'dev-access' ); ?></p>
         
         <form method="post" style="display: inline;">
@@ -434,10 +534,29 @@ function daet_options_page_html() {
     if ( ! current_user_can( $capability ) ) {
         wp_die( esc_html__( 'You do not have sufficient permissions to access this page.', 'dev-access' ) );
     }
+    
+    // Status des Audit-Logs
+    $audit_enabled = isset( $options['enable_audit_log'] ) ? $options['enable_audit_log'] : 1;
     ?>
     <div class="wrap">
         <h1><?php esc_html_e( 'DEV Access & Environment Tools', 'dev-access' ); ?></h1>
         <?php settings_errors(); ?>
+        
+        <?php if ( $audit_enabled ) : ?>
+            <div class="notice notice-info">
+                <p><?php 
+                printf( 
+                    esc_html__( 'Audit logging is active. %s', 'dev-access' ),
+                    '<a href="' . admin_url( 'tools.php?page=daet_audit_log' ) . '">' . esc_html__( 'View Security Audit Log', 'dev-access' ) . '</a>'
+                );
+                ?></p>
+            </div>
+        <?php else : ?>
+            <div class="notice notice-warning">
+                <p><?php esc_html_e( 'Audit logging is currently disabled. Enable it in the settings below to track security events.', 'dev-access' ); ?></p>
+            </div>
+        <?php endif; ?>
+        
         <div style="margin: 20px 0;">
             <a href="<?php echo admin_url( 'tools.php?page=daet_audit_log' ); ?>" class="button button-secondary">
                 <?php esc_html_e( 'View Security Audit Log', 'dev-access' ); ?>
@@ -494,8 +613,17 @@ function daet_render_field_role_select( array $args ) {
 function daet_render_field_toggle( array $args ) {
     $options = get_option('daet_settings');
     $id = $args['id'];
-    $default_value = ($id === 'enable_debug_log' || $id === 'enable_audit_log') ? 1 : 0;
-    $value = $options[$id] ?? $default_value;
+    
+    // Spezielle Default-Behandlung für wichtige Features
+    if ( $id === 'enable_audit_log' ) {
+        $default_value = ! isset( $options[$id] ) ? 1 : $options[$id];
+    } elseif ( $id === 'enable_debug_log' ) {
+        $default_value = ! isset( $options[$id] ) ? 1 : $options[$id];
+    } else {
+        $default_value = $options[$id] ?? 0;
+    }
+    
+    $value = $default_value;
     ?>
     <div style="display: flex; align-items: center; gap: 10px;">
         <label class="daet-toggle-switch">
@@ -689,13 +817,17 @@ function daet_sanitize_settings( $input ) {
         $sanitized_input['audit_retention_days'] = max(7, min(365, $retention));
     }
     
-    // Log Settings-Änderungen
-    if ( ! empty( $sanitized_input['enable_audit_log'] ) ) {
+    // Log Settings-Änderungen - aber nur wenn Audit aktiviert ist oder wird
+    $audit_will_be_enabled = isset( $sanitized_input['enable_audit_log'] ) ? $sanitized_input['enable_audit_log'] : 
+                             (isset( $old_settings['enable_audit_log'] ) ? $old_settings['enable_audit_log'] : 1);
+    
+    if ( $audit_will_be_enabled ) {
         $changes = array();
         foreach ( $sanitized_input as $key => $value ) {
-            if ( ! isset( $old_settings[$key] ) || $old_settings[$key] != $value ) {
+            $old_value = isset( $old_settings[$key] ) ? $old_settings[$key] : null;
+            if ( $old_value != $value ) {
                 $changes[$key] = array(
-                    'old' => $old_settings[$key] ?? null,
+                    'old' => $old_value,
                     'new' => $value
                 );
             }
@@ -749,12 +881,14 @@ function daet_validate_honeypot( $user, $username ) {
     return $user;
 }
 
-// Log failed login attempts
-add_action( 'wp_login_failed', 'daet_log_failed_login' );
+// Log failed login attempts - mit korrekter Priority
+add_action( 'wp_login_failed', 'daet_log_failed_login', 10 );
 function daet_log_failed_login( $username ) {
-    daet_audit_log( 'login_failed', 'warning', array(
-        'username' => $username
-    ));
+    if ( ! empty( $username ) ) {
+        daet_audit_log( 'login_failed', 'warning', array(
+            'username' => sanitize_text_field( $username )
+        ));
+    }
 }
 
 // Log successful logins
@@ -922,3 +1056,11 @@ function daet_enforce_login_restriction( $user, $username ) {
     }
     return $user;
 }
+
+// Test-Funktion für Debugging
+add_action( 'init', function() {
+    if ( defined( 'WP_DEBUG' ) && WP_DEBUG && isset( $_GET['daet_test_audit'] ) ) {
+        daet_audit_log( 'test_event', 'info', array( 'test' => 'Debug test at ' . current_time( 'mysql' ) ) );
+        wp_die( 'Audit log test completed. Check the audit log.' );
+    }
+});
